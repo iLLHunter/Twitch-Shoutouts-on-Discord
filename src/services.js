@@ -1,17 +1,11 @@
 const TWITCH_BATCH_SIZE = 100;
 const MAX_LIST_BYTES = 128 * 1024;
 const MAX_EMBED_LENGTH = 4096;
+const TWITCH_LOGIN = /^[A-Za-z0-9_]{1,25}$/;
 
 export function readConfig(env) {
   const listUrl = httpUrl(env.STREAMERS_URL, "STREAMERS_URL");
-  const webhookUrl = httpUrl(env.DISCORD_WEBHOOK_URL, "DISCORD_WEBHOOK_URL");
-  if (
-    webhookUrl.origin !== "https://discord.com" ||
-    !/^\/api\/(?:v\d+\/)?webhooks\/\d+\/[A-Za-z0-9_.-]+\/?$/.test(webhookUrl.pathname) ||
-    webhookUrl.search || webhookUrl.hash
-  ) {
-    throw new Error("DISCORD_WEBHOOK_URL must be the URL copied from a Discord channel webhook");
-  }
+  const webhookUrl = discordWebhookUrl(env.DISCORD_WEBHOOK_URL, "DISCORD_WEBHOOK_URL");
   const clientId = env.TWITCH_CLIENT_ID?.trim();
   const clientSecret = env.TWITCH_CLIENT_SECRET?.trim();
   if (!clientId || !clientSecret) {
@@ -22,16 +16,60 @@ export function readConfig(env) {
   if ((guildId && !/^\d+$/.test(guildId)) || (channelId && !/^\d+$/.test(channelId))) {
     throw new Error("DISCORD_GUILD_ID and DISCORD_CHANNEL_ID must be Discord IDs stored as text");
   }
-  const template = env.EMBED_MESSAGE ?? "Hey check out {name}! They are live at {url}";
-  if (!template.trim() || template.trim().length > MAX_EMBED_LENGTH) {
-    throw new Error("EMBED_MESSAGE must contain 1–4096 characters");
+  const listRoute = discordRoute(webhookUrl, guildId, channelId, "EMBED_MESSAGE",
+    env.EMBED_MESSAGE ?? "Hey check out {name}! They are live at {url}",
+    roleId(env.DISCORD_MENTION_ROLE_ID, "DISCORD_MENTION_ROLE_ID"));
+  const myChannel = env.MYCHANNEL?.trim();
+  const silent = String(env.SILENT_DURING_MYCHANNEL_STREAMS ?? "false").trim().toLowerCase();
+  if (!["true", "false"].includes(silent)) {
+    throw new Error("SILENT_DURING_MYCHANNEL_STREAMS must be true or false");
+  }
+  let ownRoute;
+  if (myChannel) {
+    if (!TWITCH_LOGIN.test(myChannel)) throw new Error("MYCHANNEL must be a Twitch account login");
+    const ownChannelId = env.DISCORD_MYCHANNEL_ID?.trim();
+    if (!ownChannelId || !/^\d+$/.test(ownChannelId)) {
+      throw new Error("Set DISCORD_MYCHANNEL_ID to the Discord channel ID as text when using MYCHANNEL");
+    }
+    const ownWebhook = env.DISCORD_MYCHANNEL_WEBHOOK_URL
+      ? discordWebhookUrl(env.DISCORD_MYCHANNEL_WEBHOOK_URL, "DISCORD_MYCHANNEL_WEBHOOK_URL")
+      : webhookUrl;
+    ownRoute = discordRoute(ownWebhook, guildId, ownChannelId, "MYEMBED_MESSAGE", env.MYEMBED_MESSAGE,
+      roleId(env.DISCORD_MYMENTION_ROLE_ID, "DISCORD_MYMENTION_ROLE_ID"));
+  } else if (silent === "true") {
+    throw new Error("Set MYCHANNEL to use SILENT_DURING_MYCHANNEL_STREAMS");
   }
   const cooldownHours = String(env.SHOUTOUT_COOLDOWN_HOURS ?? "4").trim();
   if (!/^(?:[1-9]|1[0-9]|2[0-4])$/.test(cooldownHours)) {
     throw new Error("SHOUTOUT_COOLDOWN_HOURS must be a whole number from 1 to 24");
   }
   const cooldownMs = Number(cooldownHours) * 60 * 60 * 1000;
-  return { listUrl, webhookUrl, clientId, clientSecret, guildId, channelId, template, cooldownMs };
+  return { listUrl, listRoute, ownRoute, myChannel, silent: silent === "true", clientId, clientSecret, cooldownMs };
+}
+
+function roleId(value, setting) {
+  const id = value?.trim();
+  if (id && !/^\d{1,20}$/.test(id)) throw new Error(`${setting} must be a Discord role ID stored as text`);
+  return id;
+}
+
+function discordRoute(webhookUrl, guildId, channelId, setting, template, mentionRoleId) {
+  if (!template?.trim() || template.trim().length > MAX_EMBED_LENGTH) {
+    throw new Error(`${setting} must contain 1–4096 characters`);
+  }
+  return { webhookUrl, guildId, channelId, setting, template, mentionRoleId };
+}
+
+function discordWebhookUrl(value, setting) {
+  const url = httpUrl(value, setting);
+  if (
+    url.origin !== "https://discord.com" ||
+    !/^\/api\/(?:v\d+\/)?webhooks\/\d+\/[A-Za-z0-9_.-]+\/?$/.test(url.pathname) ||
+    url.search || url.hash
+  ) {
+    throw new Error(`${setting} must be the URL copied from a Discord channel webhook`);
+  }
+  return url;
 }
 
 function httpUrl(value, setting) {
@@ -64,7 +102,7 @@ export async function readStreamers(request, initialUrl) {
     for (const line of (await readListText(response)).split(/\r\n|\n|\r/)) {
       const name = line.trim();
       if (!name) continue;
-      if (!/^[A-Za-z0-9_]{1,25}$/.test(name)) {
+      if (!TWITCH_LOGIN.test(name)) {
         invalid++;
         continue;
       }
@@ -145,8 +183,9 @@ export async function getLiveStreams(request, clientId, token, streamers, renewT
       const userId = stream.user_id;
       const startedAt = Date.parse(stream.started_at);
       if (typeof userId !== "string" || !userId || !Number.isFinite(startedAt)) continue;
-      const name = streamers.get(stream.user_login?.toLowerCase());
-      if (name) live.set(stream.id, { name, userId, startedAt });
+      const login = stream.user_login?.toLowerCase();
+      const name = streamers.get(login);
+      if (name) live.set(stream.id, { name, login, userId, startedAt });
     }
   }
   return live;
@@ -168,18 +207,33 @@ export async function verifyWebhook(request, config) {
 
 export async function sendShoutout(request, config, name) {
   const streamUrl = `https://twitch.tv/${name}`;
-  const description = config.template.replace(/\{(name|url)\}/g, (_, field) => (
-    field === "name" ? name : streamUrl
-  )).trim();
+  const roles = new Set(config.mentionRoleId ? [config.mentionRoleId] : []);
+  const description = config.template
+    .replace(/(?<!\\)<@&(\d{1,20})>/g, (_, id) => {
+      roles.add(id);
+      return "";
+    })
+    .replace(/\{(name|url)\}/g, (_, field) => field === "name" ? name : streamUrl)
+    .trim();
+  if (!description) throw new Error(`${config.setting} must include text for the embed alongside role mentions`);
   if (description.length > MAX_EMBED_LENGTH) {
-    throw new Error(`EMBED_MESSAGE exceeds 4096 characters after substituting placeholders for ${name}`);
+    throw new Error(`${config.setting} exceeds 4096 characters after substituting placeholders for ${name}`);
   }
   const webhookUrl = new URL(config.webhookUrl);
   webhookUrl.searchParams.set("wait", "true");
+  const payload = { embeds: [{ description }], allowed_mentions: { parse: [] } };
+  if (roles.size) {
+    const content = [...roles].map((id) => `<@&${id}>`).join(" ");
+    if (roles.size > 100 || content.length > 2000) {
+      throw new Error(`${config.setting} contains too many Discord role mentions`);
+    }
+    payload.content = content;
+    payload.allowed_mentions = { roles: [...roles] };
+  }
   const response = await request(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ embeds: [{ description }], allowed_mentions: { parse: [] } }),
+    body: JSON.stringify(payload),
   }, "Discord shoutout");
   const failure = await discordStatus(response, "Discord shoutout");
   if (failure !== null) return { sent: false, retryAt: failure };
@@ -205,7 +259,7 @@ async function discordStatus(response, service) {
   }
   if (response.status === 404) {
     await response.body?.cancel();
-    console.error({ message: "Discord webhook was not found. Replace DISCORD_WEBHOOK_URL to resume sending." });
+    console.error({ message: "Discord webhook was not found. Replace the webhook URL for that channel to resume sending." });
     return -1;
   }
   await requireSuccess(response, service);

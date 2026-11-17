@@ -19,12 +19,12 @@ export default {
       UPDATE poll_state
       SET lease_owner = ?, lease_until = ?
       WHERE id = 1 AND lease_until <= ?
-      RETURNING twitch_client_id, twitch_token, twitch_token_expires, discord_target, discord_retry_at
+      RETURNING twitch_client_id, twitch_token, twitch_token_expires
     `).bind(owner, started + 120_000, started).first();
     if (!state) return;
 
-    let { discord_target: discordTarget, discord_retry_at: discordRetryAt } = state;
-    // Reserve space under the Free plan's 50 subrequest limit for poll state and cooldown checks.
+    const backoffChanges = new Map();
+    // Reserve six calls for the lease, token, history, skipped streams, and webhook backoff.
     let operationsLeft = 44;
     const request = async (url, options, service) => {
       if (operationsLeft === 0) throw new Error("Polling exceeded its Free plan subrequest budget");
@@ -37,7 +37,13 @@ export default {
     };
 
     try {
-      const streamers = await readStreamers(request, config.listUrl);
+      const myLogin = config.myChannel?.toLowerCase();
+      const streamers = await readStreamers(request, config.listUrl).catch((error) => {
+        if (!myLogin) throw error;
+        console.error({ message: "Streamer list could not be loaded", error: error.message });
+        return new Map();
+      });
+      if (myLogin) streamers.set(myLogin, config.myChannel);
       if (!streamers.size) return;
 
       const renewToken = async () => {
@@ -55,6 +61,8 @@ export default {
         cachedToken ? renewToken : undefined,
       );
       if (!live.size) return;
+      const ownLive = myLogin && [...live.values()].find(({ login }) => login === myLogin);
+      const quiet = config.silent && Boolean(ownLive);
 
       const broadcasts = Array.from(live, ([streamId, { userId }]) => [streamId, userId]);
       const { results: history } = await db.prepare(`
@@ -73,7 +81,12 @@ export default {
       for (const { stream_id: streamId, last_shoutout_at: lastShoutoutAt, handled } of history) {
         if (handled) {
           live.delete(streamId);
-        } else if (lastShoutoutAt !== null && live.get(streamId).startedAt < lastShoutoutAt + config.cooldownMs) {
+          continue;
+        }
+        const { login, startedAt } = live.get(streamId);
+        if (login === myLogin) continue;
+        const duringCooldown = lastShoutoutAt !== null && startedAt < lastShoutoutAt + config.cooldownMs;
+        if (duringCooldown || (quiet && startedAt >= ownLive.startedAt)) {
           skipped.push(streamId);
           live.delete(streamId);
         }
@@ -84,59 +97,87 @@ export default {
       }
       if (!live.size) return;
 
-      // Track Discord backoff for this exact webhook without persisting its URL or token.
-      const path = config.webhookUrl.pathname.replace(/^\/api\/(?:v\d+\/)?|\/$/g, "");
-      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(path));
-      const target = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-      if (target !== discordTarget) {
-        discordTarget = target;
-        discordRetryAt = 0;
+      const ownBroadcasts = [];
+      const listBroadcasts = [];
+      for (const entry of live) {
+        (entry[1].login === myLogin ? ownBroadcasts : listBroadcasts).push(entry);
       }
-      if (discordRetryAt === -1 || discordRetryAt > Date.now()) return;
-
-      const verifyTarget = config.guildId || config.channelId;
-      if (operationsLeft < (verifyTarget ? 3 : 2)) {
-        throw new Error("Streamer list used too many requests to send a shoutout within the Free plan budget");
-      }
-      if (verifyTarget) {
-        const retryAt = await verifyWebhook(request, config);
-        if (retryAt !== null) {
-          discordRetryAt = retryAt;
-          return;
-        }
-      }
-
+      const deliveries = [];
+      if (ownBroadcasts.length) deliveries.push({ route: config.ownRoute, broadcasts: ownBroadcasts });
+      if (listBroadcasts.length && !quiet) deliveries.push({ route: config.listRoute, broadcasts: listBroadcasts });
+      if (!deliveries.length) return;
+      const targets = await Promise.all(deliveries.map(({ route }) => webhookTarget(route.webhookUrl)));
+      const { results: backoffs } = await db.prepare(`
+        SELECT target, retry_at FROM discord_webhook_backoff WHERE target IN (?, ?)
+      `).bind(targets[0], targets[1] ?? null).all();
+      const retryTimes = new Map(backoffs.map(({ target, retry_at }) => [target, retry_at]));
       const sentUsers = new Set();
-      for (const [streamId, { name, userId }] of live) {
-        if (sentUsers.has(userId)) continue;
-        if (operationsLeft < 2 || signal.aborted) break;
-        const delay = discordRetryAt - Date.now();
-        if (delay > 0) {
-          if (discordRetryAt >= deadline) break;
-          await new Promise((resolve) => setTimeout(resolve, delay));
-          if (signal.aborted) break;
-        }
-        const { sent, retryAt } = await sendShoutout(request, config, name);
-        discordRetryAt = retryAt;
-        if (!sent) break;
+      let deliveryError;
+      for (const [index, { route, broadcasts: pending }] of deliveries.entries()) {
+        const target = targets[index];
+        let retryAt = backoffChanges.get(target) ?? retryTimes.get(target) ?? 0;
+        if (retryAt === -1 || retryAt > Date.now() || signal.aborted) continue;
+        try {
+          const verifyTarget = route.guildId || route.channelId;
+          if (operationsLeft < (verifyTarget ? 3 : 2)) {
+            throw new Error("Streamer list used too many requests to send a shoutout within the Free plan budget");
+          }
+          if (verifyTarget) {
+            const failedUntil = await verifyWebhook(request, route);
+            if (failedUntil !== null) {
+              backoffChanges.set(target, failedUntil);
+              continue;
+            }
+          }
 
-        operationsLeft--;
-        await db.batch([
-          db.prepare("INSERT INTO announced_streams (stream_id) VALUES (?)").bind(streamId),
-          db.prepare(`
-            INSERT INTO streamer_shoutouts (user_id, last_shoutout_at) VALUES (?, ?)
-            ON CONFLICT (user_id) DO UPDATE SET last_shoutout_at = excluded.last_shoutout_at
-          `).bind(userId, Date.now()),
-        ]);
-        sentUsers.add(userId);
-        console.log({ message: "Sent Twitch shoutout", streamer: name, streamId });
+          for (const [streamId, { name, userId }] of pending) {
+            if (sentUsers.has(userId)) continue;
+            if (operationsLeft < 2 || signal.aborted) break;
+            const delay = retryAt - Date.now();
+            if (delay > 0) {
+              if (retryAt >= deadline) break;
+              await new Promise((resolve) => setTimeout(resolve, delay));
+              if (signal.aborted) break;
+            }
+            const result = await sendShoutout(request, route, name);
+            retryAt = result.retryAt;
+            if (retryAt !== (retryTimes.get(target) ?? 0) || backoffChanges.has(target)) {
+              backoffChanges.set(target, retryAt);
+            }
+            if (!result.sent) break;
+
+            operationsLeft--;
+            await db.batch([
+              db.prepare("INSERT INTO announced_streams (stream_id) VALUES (?)").bind(streamId),
+              db.prepare(`
+                INSERT INTO streamer_shoutouts (user_id, last_shoutout_at) VALUES (?, ?)
+                ON CONFLICT (user_id) DO UPDATE SET last_shoutout_at = excluded.last_shoutout_at
+              `).bind(userId, Date.now()),
+            ]);
+            sentUsers.add(userId);
+            console.log({ message: "Sent Twitch shoutout", streamer: name, streamId });
+          }
+        } catch (error) {
+          deliveryError ??= error;
+        }
       }
+      if (deliveryError) throw deliveryError;
     } finally {
-      await db.prepare(`
-        UPDATE poll_state
-        SET lease_owner = NULL, lease_until = 0, discord_target = ?, discord_retry_at = ?
-        WHERE id = 1 AND lease_owner = ?
-      `).bind(discordTarget, discordRetryAt, owner).run();
+      await db.batch([
+        ...Array.from(backoffChanges, ([target, retryAt]) => db.prepare(`
+          INSERT INTO discord_webhook_backoff (target, retry_at) VALUES (?, ?)
+          ON CONFLICT (target) DO UPDATE SET retry_at = excluded.retry_at
+        `).bind(target, retryAt)),
+        db.prepare("UPDATE poll_state SET lease_owner = NULL, lease_until = 0 WHERE id = 1 AND lease_owner = ?")
+          .bind(owner),
+      ]);
     }
   },
 };
+
+async function webhookTarget(url) {
+  // Persist only a fingerprint of the webhook URL, including its token so rotation clears backoff.
+  const path = url.pathname.replace(/^\/api\/(?:v\d+\/)?|\/$/g, "");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(path));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}

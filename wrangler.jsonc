@@ -12,7 +12,13 @@
     "STREAMERS_URL": "",
     "TWITCH_CLIENT_ID": "",
     "EMBED_MESSAGE": "Hey check out {name}! They are live at {url}",
-    "SHOUTOUT_COOLDOWN_HOURS": "4"
+    "SHOUTOUT_COOLDOWN_HOURS": "4",
+    "MYCHANNEL": "",
+    "MYEMBED_MESSAGE": "{name} is live at {url}",
+    "DISCORD_MYCHANNEL_ID": "",
+    "DISCORD_MENTION_ROLE_ID": "",
+    "DISCORD_MYMENTION_ROLE_ID": "",
+    "SILENT_DURING_MYCHANNEL_STREAMS": "false"
     // Optional text variables: DISCORD_GUILD_ID and DISCORD_CHANNEL_ID
   },
   "d1_databases": [

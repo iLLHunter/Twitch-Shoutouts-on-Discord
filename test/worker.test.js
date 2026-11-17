@@ -35,6 +35,7 @@ async function setup(t, settings = {}) {
     invalidBearer: null,
     batches: [],
     shoutouts: [],
+    destinations: [],
     webhook: async () => Response.json({ id: "message" }),
     route: { guild_id: "10", channel_id: "20" },
   };
@@ -60,10 +61,13 @@ async function setup(t, settings = {}) {
         })) });
       }
       case "discord.com":
-        if (!init.method) return Response.json(upstream.route);
+        if (!init.method) {
+          return Response.json(url.pathname.includes("/456/") ? { guild_id: "10", channel_id: "30" } : upstream.route);
+        }
         assert.equal(url.searchParams.get("wait"), "true");
         upstream.shoutouts.push(JSON.parse(init.body));
-        return upstream.webhook();
+        upstream.destinations.push(url.pathname);
+        return upstream.webhook(url);
       default:
         assert.fail(`Unexpected test host ${url.hostname}`);
     }
@@ -181,7 +185,7 @@ test("backs off after Discord rate limits and retries a still-live stream", asyn
   await poll();
   assert.deepEqual(await sent(), []);
   assert.equal(upstream.shoutouts.length, 1);
-  await config.DB.prepare("UPDATE poll_state SET discord_retry_at = 0").run();
+  await config.DB.prepare("UPDATE discord_webhook_backoff SET retry_at = 0").run();
   upstream.webhook = async () => Response.json({ id: "message" });
   await poll();
   assert.deepEqual(await sent(), ["first-broadcast"]);
@@ -212,4 +216,75 @@ test("continues an announcement burst across polls within the subrequest budget"
   await poll();
   assert.equal(upstream.shoutouts.length, logins.length);
   assert.deepEqual(await sent(), logins.sort());
+});
+
+const ownSettings = {
+  MYCHANNEL: "My_Stream",
+  MYEMBED_MESSAGE: "I am live at {url}!",
+  DISCORD_MYCHANNEL_ID: "30",
+  DISCORD_MYCHANNEL_WEBHOOK_URL: "https://discord.com/api/webhooks/456/own-test-token",
+};
+
+test("routes the configured account separately and sends it only once if also listed", async (t) => {
+  const { upstream, sent, poll } = await setup(t, ownSettings);
+  upstream.list += "my_stream\n";
+  upstream.live.set("my_stream", "my-first-broadcast");
+  await poll();
+  await poll();
+  assert.deepEqual(await sent(), ["first-broadcast", "my-first-broadcast"]);
+  assert.deepEqual(upstream.destinations, ["/api/webhooks/456/own-test-token", "/api/webhooks/123/test-token"]);
+  assert.equal(upstream.shoutouts[0].embeds[0].description, "I am live at https://twitch.tv/My_Stream!");
+
+  upstream.live.set("my_stream", "my-second-broadcast");
+  await poll();
+  assert.deepEqual(await sent(), ["first-broadcast", "my-first-broadcast", "my-second-broadcast"]);
+});
+
+test("Discord throttling on one webhook does not block the other channel", async (t) => {
+  const { upstream, sent, poll } = await setup(t, ownSettings);
+  upstream.live.set("my_stream", "my-first-broadcast");
+  upstream.webhook = async (url) => url.pathname.includes("/456/")
+    ? Response.json({ retry_after: 65 }, { status: 429 })
+    : Response.json({ id: "message" });
+  await poll();
+  await poll();
+  assert.deepEqual(await sent(), ["first-broadcast"]);
+  assert.equal(upstream.destinations.length, 2);
+});
+
+test("skips broadcasts started during silent mode even after the configured account ends its stream", async (t) => {
+  const { upstream, sent, poll } = await setup(t, { ...ownSettings, SILENT_DURING_MYCHANNEL_STREAMS: "true" });
+  const now = Date.now();
+  upstream.live.set("my_stream", "my-first-broadcast");
+  upstream.startTimes.set("my_stream", now - 60_000);
+  upstream.startTimes.set("example_one", now - 10_000);
+  await poll();
+  await poll();
+  upstream.live.delete("my_stream");
+  await poll();
+  assert.deepEqual(await sent(), ["my-first-broadcast"]);
+  assert.deepEqual(upstream.destinations, ["/api/webhooks/456/own-test-token"]);
+  upstream.live.set("example_one", "next-broadcast");
+  await poll();
+  assert.deepEqual(await sent(), ["my-first-broadcast", "next-broadcast"]);
+});
+
+test("moves template and configured roles above each embed with an explicit Discord allowlist", async (t) => {
+  const { upstream, poll } = await setup(t, {
+    ...ownSettings,
+    MYEMBED_MESSAGE: "<@&111> {name} is live",
+    DISCORD_MYMENTION_ROLE_ID: "111",
+    EMBED_MESSAGE: "<@&222> {name} is live @everyone",
+    DISCORD_MENTION_ROLE_ID: "333",
+  });
+  upstream.live.set("my_stream", "my-first-broadcast");
+  await poll();
+  assert.deepEqual(upstream.shoutouts, [
+    { content: "<@&111>", allowed_mentions: { roles: ["111"] }, embeds: [{ description: "My_Stream is live" }] },
+    {
+      content: "<@&333> <@&222>",
+      allowed_mentions: { roles: ["333", "222"] },
+      embeds: [{ description: "Example_One is live @everyone" }],
+    },
+  ]);
 });
