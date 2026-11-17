@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "discord-twitch-shoutouts",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-16",
+  "workers_dev": false,
+  "preview_urls": false,
+  "keep_vars": true,
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["* * * * *"] },
+  "vars": {
+    "STREAMERS_URL": "",
+    "TWITCH_CLIENT_ID": "",
+    "EMBED_MESSAGE": "Hey check out {name}! They are live at {url}",
+    "SHOUTOUT_COOLDOWN_HOURS": "4"
+    // Optional text variables: DISCORD_GUILD_ID and DISCORD_CHANNEL_ID
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "discord-twitch-shoutouts",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}
